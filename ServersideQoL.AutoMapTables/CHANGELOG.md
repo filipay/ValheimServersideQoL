@@ -1,3 +1,6 @@
+### Unreleased
+- Prevented AutoMapTables from throwing when multiple peers have the same player ID.
+
 ### 2.2.0
 - Fixed ore deposits/dungeons sometimes not being recognized [#239](https://github.com/ArgusMagnus/ValheimServersideQoL/issues/239)
 
