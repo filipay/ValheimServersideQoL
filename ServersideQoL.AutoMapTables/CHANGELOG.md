@@ -1,3 +1,9 @@
+### Unreleased
+- Added per-character pending observed-travel exploration, published with generated discoveries only at an eligible same-character pass-by. Nearby tables lazily receive the world-shared union; reading remains manual.
+- Added original-builder names to ship labels using the persistent last-known character-name cache, with ordinary ship labels for unknown builders and unchanged pin ownership.
+- Preserved table-local manual pins regardless of the legacy `DiscardPlayerPins` option. Legacy generated pins stay local until their owner supplies a complete authoritative snapshot.
+- Retained pending/published state separately across normal world saves/restarts and reapplied published data after stale table writes on later eligible approaches. Concurrent manual writes are not made lossless; imported PS5 labels may remain unchanged by vanilla position deduplication.
+
 ### v2.4.1
 - Fixed floating ships near map tables constantly updating the map tables causing performance issues [#369](https://github.com/ArgusMagnus/ValheimServersideQoL/pull/369)
 

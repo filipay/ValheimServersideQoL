@@ -1,7 +1,9 @@
-﻿using ServersideQoL.Processors;
+﻿using BepInEx.Configuration;
+using HarmonyLib;
+using ServersideQoL.Processors;
 using ServersideQoL.Utilities;
+using System.Reflection;
 using UnityEngine;
-using YamlDotNet.Core.Tokens;
 
 namespace ServersideQoL.AutoMapTables;
 
@@ -11,7 +13,7 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
 {
   public const string Id = "05450dd6-13bd-42cc-9bd3-b1eed5e501af";
 
-  public sealed record PrefabInfo(MapTable? MapTable, PrivateArea? PrivateArea, TeleportWorld? TeleportWorld, Ship? Ship, MineRock5? MineRock5, LocationProxy? LocationProxy) : ProcessorPrefabInfo
+  public sealed record PrefabInfo(MapTable? MapTable, PrivateArea? PrivateArea, TeleportWorld? TeleportWorld, Ship? Ship, MineRock5? MineRock5, LocationProxy? LocationProxy, Player? Player) : ProcessorPrefabInfo
   {
     public Config.OreDepositConfig? MineRockPinConfig => field ??= MineRock5 is not null && Config.Instance.AutoUpdateOreDeposits.TryGetValue(PrefabInfo.PrefabHash, out var value) ? value : null;
     public Piece? Piece => field ??= PrefabInfo.GetComponent<Piece>();
@@ -25,48 +27,58 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
 
   readonly Dictionary<ServersideQoLZDO, MapTableState> _mapTables = [];
   readonly Dictionary<PlayerID, PlayerState> _playerStates = [];
-  readonly HashSet<ServersideQoLZDO> _wards = [];
-  readonly Dictionary<ServersideQoLZDO, Vector3> _shipPositions = [];
+  readonly Dictionary<ServersideQoLZDO, SharedMapData.Pin> _shipPositions = [];
   readonly Dictionary<PlayerID, (Peer Peer, PlayerState PlayerState)> _updateList = [];
-  readonly List<Pin> _pins = [];
-  readonly HashSet<(Minimap.PinType, string)> _oreDepositPins = [];
-  byte[]? _emptyExplored;
   float _mapTableRangeSqr;
   float _oreDepositRangeSqr;
   float _dungeonRangeSqr;
+  ExplorationState? _exploration;
+  bool _explorationLoadFailed;
+  bool _explorationWarningLogged;
+  bool _explorationReady;
+  bool _wardPatchesInstalled;
+  bool _wardWarningLogged;
+  ZDOMan? _wardZDOMan;
+  static readonly WardIndex<ZDOID> __wardIndex = new();
 
   static readonly ServerVar<HashSet<PlayerID>> __playerIDsVar = AutoMapTablesPlugin.RegisterServerVar<HashSet<PlayerID>>("PlayerIDs");
+  static readonly ServerVar<byte[]> __explorationVar = AutoMapTablesPlugin.RegisterServerVar<byte[]>("ExplorationState");
 
   protected override void Initialize()
   {
+    Config.Instance.ConfigChanged -= OnWardConfigChanged;
+    Config.Instance.ConfigChanged += OnWardConfigChanged;
+    __wardIndex.BeginSeed();
+    if (!_wardPatchesInstalled)
+    {
+      AutoMapTablesPlugin.HarmonyInstance.PatchAll(typeof(WardLifecyclePatches));
+      _wardPatchesInstalled = true;
+    }
+    if (_wardZDOMan is not null)
+      _wardZDOMan.m_onZDODestroyed -= QueueWardDestroyed;
+    _wardZDOMan = ZDOMan.instance;
+    _wardZDOMan.m_onZDODestroyed += QueueWardDestroyed;
+    _wardWarningLogged = false;
     _mapTableRangeSqr = Config.Instance.MapTableRange.Value * Config.Instance.MapTableRange.Value;
     _oreDepositRangeSqr = Config.Instance.OreDepositsDiscoverRange.Value * Config.Instance.OreDepositsDiscoverRange.Value;
     _dungeonRangeSqr = Config.Instance.DungeonsDiscoverRange.Value * Config.Instance.DungeonsDiscoverRange.Value;
-
-    _oreDepositPins.Clear();
-    foreach (var (pin, label) in Config.Instance.AutoUpdateOreDeposits.Values)
-    {
-      if (pin.Value is not Minimap.PinType.None)
-        _oreDepositPins.Add((pin.Value, label.Value));
-    }
+    _exploration = null;
+    _explorationLoadFailed = false;
+    _explorationWarningLogged = false;
+    _explorationReady = false;
 
     _mapTables.Clear();
     _playerStates.Clear();
-    _wards.Clear();
     _shipPositions.Clear();
 
     foreach (var zdo in ZDOMan.instance.m_objectsByID.Values.Select(static x => x.ServersideQoLZDO))
     {
+      __wardIndex.Seed(zdo.ZDO.m_uid, GetPrefabInfo(zdo).GetComponent<PrivateArea>() is not null);
       switch (GetProcessorPrefabInfo(zdo))
       {
         case { MapTable: not null }:
           _mapTables.Add(zdo, new(zdo));
           zdo.Destroyed += OnMapTableDestroyed;
-          break;
-
-        case { PrivateArea: not null }:
-          _wards.Add(zdo);
-          zdo.Destroyed += OnWardDestroyed;
           break;
 
         case { TeleportWorld: not null }:
@@ -93,6 +105,7 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
 
         case { LocationProxy: not null }:
           {
+            zdo.Destroyed += OnDungeonDestroyed;
             if (__playerIDsVar.Get(zdo) is { } playerIDs)
             {
               foreach (var id in playerIDs)
@@ -114,26 +127,24 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
     }
 
     _playerStates.Remove(default);
-
-    if (_wards.Count is not 0)
-    {
-      foreach (var (mapTable, mapTableState) in _mapTables)
-      {
-        foreach (var ward in _wards)
-        {
-          if (Utils.DistanceXZ(ward.ZDO.GetPosition(), mapTable.ZDO.GetPosition()) > ward.Fields<PrivateArea>().GetFloat(static () => x => x.m_radius))
-            continue;
-
-          (mapTableState.Wards ??= []).Add(ward);
-        }
-
-        UpdateMapTablePermittedPlayerIDs(mapTableState);
-      }
-    }
+    __wardIndex.CompleteSeed();
+    if (!Config.Instance.Enabled.Value)
+      __wardIndex.Suspend();
   }
 
   protected override ProcessResult Process(ServersideQoLZDO zdo, IReadOnlyList<Peer> peers, PrefabInfo prefabInfo)
   {
+    if (prefabInfo.Player is not null)
+    {
+      foreach (var peer in peers.Enumerate())
+      {
+        if (peer.ZNetPeer.m_characterID == zdo.ZDO.m_uid)
+          return ScheduleReprocessing(_explorationLoadFailed ? 1 :
+            _exploration?.GetSampleDelay(zdo.Vars.GetPlayerID().Value, Time.realtimeSinceStartupAsDouble) ?? 0);
+      }
+      return default;
+    }
+
     ProcessResult result;
 
     if (prefabInfo.MapTable is not null)
@@ -142,28 +153,38 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
       {
         _mapTables.Add(zdo, state = new(zdo));
         zdo.Destroyed += OnMapTableDestroyed;
-
-        foreach (var ward in _wards)
-        {
-          if (Utils.DistanceXZ(ward.ZDO.GetPosition(), zdo.ZDO.GetPosition()) > ward.Fields<PrivateArea>().GetFloat(static () => x => x.m_radius))
-            continue;
-
-          (state.Wards ??= []).Add(ward);
-        }
-
-        UpdateMapTablePermittedPlayerIDs(state);
       }
 
+      if (!TryServiceWardIndex())
+        return ScheduleReprocessing(1);
+      WardAccess.TableAccess? access;
+      try
+      {
+        access = __wardIndex.Prepare(IsCurrentWard, id => ReadCurrentWard(id, zdo.ZDO.GetPosition()));
+        if (access is null)
+          throw new InvalidOperationException("Ward membership initialization is incomplete");
+        _wardWarningLogged = false;
+      }
+      catch (Exception ex)
+      {
+        if (!_wardWarningLogged)
+          Logger.LogWarning($"Map table publication suspended until ward authorization can be prepared: {ex.Message}");
+        _wardWarningLogged = true;
+        return ScheduleReprocessing(1);
+      }
+      _updateList.Clear();
       foreach (var peer in peers.Enumerate())
       {
-        if (peer.PlayerState?.PlayerID is not { } playerID)
+        if (ZDOMan.instance.GetZDO(peer.ZNetPeer.m_characterID) is not { } character ||
+            GetProcessorPrefabInfo(character.ServersideQoLZDO)?.Player is null)
           continue;
-        if (state.PermittedPlayerIDs is { Count: > 0 } && !state.PermittedPlayerIDs.Contains(playerID))
+        var playerID = character.ServersideQoLZDO.Vars.GetPlayerID();
+        var distance = Utils.DistanceSqr(zdo.ZDO.GetPosition(), character.GetPosition());
+        if (!float.IsFinite(distance) || distance > _mapTableRangeSqr)
           continue;
-        if (!_playerStates.TryGetValue(playerID, out var playerState) || playerState.UpToDateMapTables.Contains(zdo))
+        if (playerID.Value == 0 || !access.CanWrite(playerID.Value))
           continue;
-        if (Utils.DistanceSqr(zdo.ZDO.GetPosition(), peer.RefPos) > _mapTableRangeSqr)
-          continue;
+        var playerState = GetOrAddPlayerState(playerID);
         if (!_updateList.TryAdd(playerID, (peer, playerState)))
         {
           if (peer.ZNetPeer.m_rpc.GetTimeSinceLastPing() < _updateList[playerID].Peer.ZNetPeer.m_rpc.GetTimeSinceLastPing())
@@ -171,30 +192,22 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
         }
       }
 
-      if (_updateList.Count > 0 || state.LastDataRevision != zdo.ZDO.DataRevision)
+      if (_updateList.Count > 0)
       {
-        UpdateMapTable(state, _updateList);
-        _updateList.Clear();
+        try
+        {
+          UpdateMapTable(state, _updateList);
+        }
+        finally
+        {
+          _updateList.Clear();
+        }
       }
 
       result = ScheduleReprocessing(1);
     }
     else if (prefabInfo.PrivateArea is not null)
     {
-      if (_wards.Add(zdo))
-      {
-        zdo.Destroyed += OnWardDestroyed;
-        foreach (var (mapTable, mapTableState) in _mapTables)
-        {
-          if (Utils.DistanceXZ(zdo.ZDO.GetPosition(), mapTable.ZDO.GetPosition()) > zdo.Fields<PrivateArea>().GetFloat(static () => x => x.m_radius))
-            continue;
-
-          (mapTableState.Wards ??= []).Add(zdo);
-        }
-      }
-
-      foreach (var state in _mapTables.Values)
-        UpdateMapTablePermittedPlayerIDs(state);
       result = default;
     }
     else if (prefabInfo.TeleportWorld is not null)
@@ -221,12 +234,9 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
       if (peers.Any(x => x.PlayerState?.PlayerID == playerID))
       {
         var state = GetOrAddPlayerState(playerID);
-        var pos = zdo.ZDO.GetPosition();
         if (state.Ships.Add(zdo))
-          zdo.Destroyed += OnShipDestroyed;
-        if (!_shipPositions.TryGetValue(zdo, out var last) || Utils.DistanceXZ(pos, last) >= Minimap.instance.m_pixelSize)
         {
-          _shipPositions[zdo] = pos;
+          zdo.Destroyed += OnShipDestroyed;
           state.UpToDateMapTables.Clear();
         }
       }
@@ -269,6 +279,8 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
     }
     else if (prefabInfo.LocationProxy is not null)
     {
+      zdo.Destroyed -= OnDungeonDestroyed;
+      zdo.Destroyed += OnDungeonDestroyed;
       var hash = zdo.Vars.GetLocation();
       if (hash is 0)
         return default;
@@ -325,6 +337,88 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
     return result;
   }
 
+  protected override void PreProcess(PeersEnumerable peers)
+  {
+    TryServiceWardIndex();
+    _explorationReady = false;
+    var minimap = Minimap.instance;
+    if (minimap is null || minimap.m_textureSize <= 0 || (long)minimap.m_textureSize * minimap.m_textureSize > int.MaxValue - 7 ||
+        !float.IsFinite(minimap.m_pixelSize) || minimap.m_pixelSize <= 0 ||
+        !float.IsFinite(minimap.m_exploreInterval) || minimap.m_exploreInterval <= 0 ||
+        !float.IsFinite(minimap.m_exploreRadius) || minimap.m_exploreRadius < 0 ||
+        Math.Ceiling(minimap.m_exploreRadius / minimap.m_pixelSize) > int.MaxValue)
+    {
+      if (!_explorationWarningLogged)
+      {
+        Logger.LogWarning("Travel sampling suspended: runtime Minimap settings are unavailable or invalid");
+        _explorationWarningLogged = true;
+      }
+      return;
+    }
+
+    if (_explorationLoadFailed)
+      return;
+    if (_exploration is null)
+    {
+      try
+      {
+        _exploration = __explorationVar.Get(DataZDO) is { } data
+          ? ExplorationState.Deserialize(Utils.Decompress(data), minimap.m_textureSize, minimap.m_pixelSize)
+          : new(minimap.m_textureSize, minimap.m_pixelSize);
+        if (_exploration.HasGenerated)
+        {
+          var liveSources = ZDOMan.instance.m_objectsByID.Values.ToDictionary(static value => value.m_uid.ToString());
+          _exploration.PruneGenerated(liveSources.ContainsKey);
+          _exploration.ResolveGeneratedMetadata(discovery => liveSources.TryGetValue(discovery.Source, out var source)
+            ? discovery with { Kind = DiscoveryKind(source.ServersideQoLZDO), PrefabHash = source.GetPrefab() } : discovery);
+        }
+      }
+      catch (Exception ex)
+      {
+        _explorationLoadFailed = true;
+        Logger.LogWarning($"Travel sampling disabled; retaining unreadable exploration state: {ex.Message}");
+        return;
+      }
+    }
+    if (_exploration.TextureSize != minimap.m_textureSize || _exploration.PixelSize != minimap.m_pixelSize)
+    {
+      if (!_explorationWarningLogged)
+      {
+        Logger.LogWarning("Travel sampling suspended: runtime Minimap geometry changed; retaining exploration state");
+        _explorationWarningLogged = true;
+      }
+      return;
+    }
+    try
+    {
+      _exploration.SampleCohort(ExplorationObservations(peers), Time.realtimeSinceStartupAsDouble,
+        minimap.m_exploreInterval, minimap.m_exploreRadius, PersistExploration);
+      _explorationWarningLogged = false;
+      _explorationReady = true;
+    }
+    catch (Exception ex)
+    {
+      if (!_explorationWarningLogged)
+        Logger.LogWarning($"Unable to finish or persist exploration cohort; will retry: {ex.Message}");
+      _explorationWarningLogged = true;
+    }
+  }
+
+  static IEnumerable<(long ID, string? Name, float X, float Z, bool InInterior)> ExplorationObservations(PeersEnumerable peers)
+  {
+    foreach (var peer in peers)
+    {
+      if (ZDOMan.instance.GetZDO(peer.ZNetPeer.m_characterID) is not { } zdo ||
+          GetProcessorPrefabInfo(zdo.ServersideQoLZDO)?.Player is null)
+        continue;
+      var character = zdo.ServersideQoLZDO;
+      var pos = zdo.GetPosition();
+      yield return (character.Vars.GetPlayerID().Value, character.Vars.GetPlayerName(), pos.x, pos.z, Character.InInterior(pos));
+    }
+  }
+
+  static void PersistExploration(byte[] data) => __explorationVar.Set(DataZDO, Utils.Compress(data));
+
   PlayerState GetOrAddPlayerState(PlayerID playerID)
   {
     if (!_playerStates.TryGetValue(playerID, out var state))
@@ -332,170 +426,231 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
     return state;
   }
 
-  static void AddPermittedPlayerIDs(ServersideQoLZDO ward, HashSet<PlayerID> permittedPlayerIDs)
+  static void OnWardConfigChanged(object sender, SettingChangedEventArgs args)
   {
-    ward.AssertIs<PrivateArea>();
-    System.Diagnostics.Debug.Assert(ward.Vars.GetEnabled());
+    if (!((Config)sender).Enabled.Value)
+      __wardIndex.Suspend();
+  }
 
-    permittedPlayerIDs.Add(ward.Vars.GetCreator());
+  bool TryServiceWardIndex()
+  {
+    try
+    {
+      if (!Config.Instance.Enabled.Value)
+      {
+        __wardIndex.Suspend();
+        return false;
+      }
+      if (__wardIndex.NeedsSeed)
+      {
+        __wardIndex.BeginSeed();
+        foreach (var zdo in ZDOMan.instance.m_objectsByID.Values)
+          __wardIndex.Seed(zdo.m_uid, GetPrefabInfo(zdo.GetPrefab()).GetComponent<PrivateArea>() is not null);
+        __wardIndex.CompleteSeed();
+      }
+      if (!Config.Instance.Enabled.Value)
+      {
+        __wardIndex.Suspend();
+        return false;
+      }
+      if (!__wardIndex.Service(IsCurrentWard))
+        throw new InvalidOperationException("Ward membership needs a complete reseed");
+      return true;
+    }
+    catch (Exception ex)
+    {
+      if (!_wardWarningLogged)
+        Logger.LogWarning($"Unable to service ward membership; table publication remains suspended: {ex.Message}");
+      _wardWarningLogged = true;
+      return false;
+    }
+  }
 
-    /// <see cref="PrivateArea.GetPermittedPlayers"/>
+  static void QueueWardDestroyed(ZDO zdo) => __wardIndex.Changed(zdo.m_uid, default);
+
+  static bool IsCurrentWard(ZDOID id) => ZDOMan.instance.GetZDO(id) is { } zdo &&
+    GetPrefabInfo(zdo.GetPrefab()).GetComponent<PrivateArea>() is not null;
+
+  static WardAccess.Snapshot? ReadCurrentWard(ZDOID id, Vector3 tablePosition)
+  {
+    if (ZDOMan.instance.GetZDO(id) is not { } zdo || GetPrefabInfo(zdo.GetPrefab()).GetComponent<PrivateArea>() is not { } area)
+      return null;
+    var ward = zdo.ServersideQoLZDO;
+    var enabled = ward.Vars.GetEnabled();
+    // Read persisted markers directly: generic component accessors memoize HasFields across receives.
+    var radius = WardAccess.ReadRadius(ZNetView.CustomFieldsStr, area.GetType().Name, area.m_radius,
+      key => zdo.GetBool(key), (key, fallback) => zdo.GetFloat(key, fallback));
+    var distance = Utils.DistanceXZ(zdo.GetPosition(), tablePosition);
+    if (!enabled || !WardAccess.Covers(distance, radius))
+      return new(enabled, distance, radius, 0, []);
+    List<long> permitted = [];
     var count = ward.Vars.GetPermitted();
     for (int i = 0; i < count; i++)
     {
-      var playerID = ward.ZDO.GetLong(Invariant($"pu_id{i}"));
-      if (playerID is not 0)
-        permittedPlayerIDs.Add(new(playerID));
+      var playerID = zdo.GetLong(Invariant($"pu_id{i}"));
+      if (playerID != 0)
+        permitted.Add(playerID);
     }
+    return new(enabled, distance, radius, ward.Vars.GetCreator().Value, permitted.ToArray());
   }
 
-  void UpdateMapTablePermittedPlayerIDs(MapTableState state)
+  [HarmonyPatch]
+  static class WardLifecyclePatches
   {
-    foreach (var playerState in _playerStates.Values)
-      playerState.UpToDateMapTables.Remove(state.ZDO);
+    [HarmonyTargetMethods]
+    public static IEnumerable<MethodInfo> TargetMethods()
+    {
+      var zdo = new ZDO();
+      yield return ((Delegate)zdo.SetPrefab).Method;
+      yield return ((Delegate)zdo.Deserialize).Method;
+      yield return ((Delegate)zdo.Load).Method;
+      yield return ((Delegate)zdo.LoadOldFormat).Method;
+      yield return ((Delegate)zdo.Reset).Method;
+    }
 
-    state.PermittedPlayerIDs?.Clear();
-    if (state.Wards is not { Count: > 0 })
+    [HarmonyPrefix]
+    public static void Prefix(ZDO __instance, out ZDOID __state) => __state = __instance.m_uid;
+
+    [HarmonyPostfix]
+    public static void Postfix(ZDO __instance, ZDOID __state) => __wardIndex.Changed(__state, __instance.m_uid);
+  }
+
+  void UpdateMapTable(MapTableState state, Dictionary<PlayerID, (Peer Peer, PlayerState PlayerState)> peers)
+  {
+    if (!_explorationReady || _exploration is null)
       return;
-
-    foreach (var ward in state.Wards)
+    try
     {
-      if (ward.Vars.GetEnabled())
-        AddPermittedPlayerIDs(ward, state.PermittedPlayerIDs ??= []);
+      var contributions = peers.Values.Select(x => CollectDiscoveries(x.Item2)).ToArray();
+      var changed = _exploration.Reconcile(state.ZDO.Vars.GetData(), peers.Count > 0,
+        contributions, static owner => new PlayerID(owner).IsModPlayerID(), PersistExploration, data => state.ZDO.Vars.SetData(data),
+        EmitDiscovery, state.Cursor, state.ZDO.ZDO.DataRevision);
+      foreach (var contribution in contributions)
+      {
+        if (contribution.Complete)
+          peers[new(contribution.CharacterID)].Item2.UpToDateMapTables.Add(state.ZDO);
+      }
+      state.Cursor.DataRevision = state.ZDO.ZDO.DataRevision;
+      state.FailedDataRevision = null;
+      if (changed)
+        ShowMessage(peers.Values.Select(static x => x.Item1), state.ZDO, Config.Instance.Localization.Value.Updated, Config.Instance.UpdatedMessageType.Value);
+    }
+    catch (Exception ex)
+    {
+      if (state.FailedDataRevision != state.ZDO.ZDO.DataRevision)
+      {
+        Logger.LogWarning($"Unable to finish map table reconciliation; retaining recoverable state for retry: {ex.Message}");
+        state.FailedDataRevision = state.ZDO.ZDO.DataRevision;
+      }
     }
   }
 
-  void UpdateMapTable(MapTableState state, Dictionary<PlayerID, (Peer, PlayerState)> peers)
+  static SharedMapData.DiscoveryKind DiscoveryKind(ServersideQoLZDO zdo)
   {
-    /// <see cref="Minimap.GetSharedMapData"/> <see cref="Minimap.AddSharedMapData"/>
-    
-    const Version.SharedMap MapDataVersion = Version.SharedMap.PinsAuthor;
+    var prefab = GetPrefabInfo(zdo);
+    if (prefab.HasComponent<TeleportWorld>()) return SharedMapData.DiscoveryKind.Portal;
+    if (prefab.HasComponent<Ship>()) return SharedMapData.DiscoveryKind.Ship;
+    if (prefab.HasComponent<MineRock5>()) return SharedMapData.DiscoveryKind.Ore;
+    if (prefab.HasComponent<LocationProxy>()) return SharedMapData.DiscoveryKind.Dungeon;
+    return SharedMapData.DiscoveryKind.Unknown;
+  }
 
-    var pkg = SingletonCache<ZPackage>.Instance;
-    var data = state.ZDO.Vars.GetData();
-    if (data is not null)
+  SharedMapData.Pin? EmitDiscovery(SharedMapData.Discovery discovery)
+  {
+    var type = discovery.Kind switch
     {
-      data = Utils.Decompress(data);
-      pkg.Load(data);
-      var version = (Version.SharedMap)pkg.ReadInt();
-      if (version is not MapDataVersion)
-      {
-        Logger.LogWarning(Invariant($"MapTable data version {version:D} [{version}] is not supported"));
-        return;
-      }
-      data = pkg.ReadByteArray();
-      if (data.Length != Minimap.instance.m_textureSize * Minimap.instance.m_textureSize)
-      {
-        Logger.LogWarning("Invalid explored map data length");
-        data = null;
-      }
+      SharedMapData.DiscoveryKind.Portal => Config.Instance.PortalsPinType.Value,
+      SharedMapData.DiscoveryKind.Ship => Config.Instance.ShipsPinType.Value,
+      SharedMapData.DiscoveryKind.Ore when (Config.Instance.OreDepositsPinTarget.Value & Config.PinTargets.MapTable) != 0 &&
+        Config.Instance.AutoUpdateOreDeposits.TryGetValue(discovery.PrefabHash, out var ore) => ore.PinType.Value,
+      SharedMapData.DiscoveryKind.Dungeon when (Config.Instance.DungeonsPinTarget.Value & Config.PinTargets.MapTable) != 0 => Config.Instance.DungeonsPinType.Value,
+      _ => Minimap.PinType.None
+    };
+    if (type == Minimap.PinType.None)
+      return null;
+    var pin = discovery.Pin with { Type = (int)type };
+    if (discovery.Kind == SharedMapData.DiscoveryKind.Ship && new PlayerID(pin.Owner).IsModPlayerID(out PlayerID builderID))
+      pin = pin with { Name = ShipLabel.Format(pin.Name, _exploration?.GetName(builderID.Value)) };
+    return pin;
+  }
 
-      var pinCount = pkg.ReadInt();
-      if (_pins.Capacity < pinCount)
-        _pins.Capacity = pinCount;
-
-      for (int i = 0; i < pinCount; i++)
+  SharedMapData.Contribution CollectDiscoveries(PlayerState playerState)
+  {
+    List<SharedMapData.Discovery> pins = [];
+    var complete = true;
+    void Add(ServersideQoLZDO zdo, string name, Minimap.PinType type)
+    {
+      var pos = zdo.ZDO.GetPosition();
+      var kind = DiscoveryKind(zdo);
+      var pin = new SharedMapData.Pin(playerState.PlayerID.AsModPlayerID().Value,
+        name, pos.x, pos.y, pos.z, (int)type, false, AutoMapTablesPlugin.PluginGuid);
+      if (kind == SharedMapData.DiscoveryKind.Ship)
       {
-        var pin = new Pin(new(pkg.ReadLong()), pkg.ReadString(), pkg.ReadVector3(), (Minimap.PinType)pkg.ReadInt(), pkg.ReadBool(), pkg.ReadString());
-        if (pin.OwnerId.IsModPlayerID(out PlayerID playerID))
-        {
-          if (!peers.ContainsKey(playerID))
-            _pins.Add(pin);
-        }
-        else if (!Config.Instance.DiscardPlayerPins.Value || _oreDepositPins.Contains((pin.Type, pin.Tag)))
-          _pins.Add(pin);
+        if (_shipPositions.TryGetValue(zdo, out var previous))
+          pin = SharedMapData.StabilizeShipPosition(pin, previous, Minimap.instance.m_pixelSize);
+        _shipPositions[zdo] = pin;
       }
+      pins.Add(new(zdo.ZDO.m_uid.ToString(), pin, kind, zdo.ZDO.GetPrefab()));
     }
 
-    foreach (var (_, playerState) in peers.Values)
+    foreach (var zdo in playerState.Portals)
+      Add(zdo, zdo.Vars.GetTag(), Config.Instance.PortalsPinType.Value);
+
+    foreach (var zdo in playerState.Ships)
+      Add(zdo, GetProcessorPrefabInfo(zdo)!.Piece!.m_name, Config.Instance.ShipsPinType.Value);
+
+    foreach (var zdo in playerState.OreVeins)
     {
-      playerState.UpToDateMapTables.Add(state.ZDO);
-
-      if (Config.Instance.PortalsPinType.Value is not Minimap.PinType.None)
-      {
-        foreach (var zdo in playerState.Portals)
-          _pins.Add(new(playerState.PlayerID.AsModPlayerID(), zdo.Vars.GetTag(), zdo.ZDO.GetPosition(), Config.Instance.PortalsPinType.Value, false, AutoMapTablesPlugin.PluginGuid));
-      }
-
-      if (Config.Instance.ShipsPinType.Value is not Minimap.PinType.None)
-      {
-        foreach (var zdo in playerState.Ships)
-          _pins.Add(new(playerState.PlayerID.AsModPlayerID(), GetProcessorPrefabInfo(zdo)!.Piece!.m_name, zdo.ZDO.GetPosition(), Config.Instance.ShipsPinType.Value, false, AutoMapTablesPlugin.PluginGuid));
-      }
-
-      if (_oreDepositPins.Count is not 0 && (Config.Instance.OreDepositsPinTarget.Value & Config.PinTargets.MapTable) is not 0)
-      {
-        foreach (var zdo in playerState.OreVeins)
-        {
-          if (GetProcessorPrefabInfo(zdo) is { MineRockPinConfig: { PinType.Value: not Minimap.PinType.None } cfg, MineRock5: { } mineRock })
-            _pins.Add(new(playerState.PlayerID.AsModPlayerID(), cfg.Label.Value is Config.DefaultOreDepositName ? mineRock.m_name : cfg.Label.Value, zdo.ZDO.GetPosition(), cfg.PinType.Value, false, AutoMapTablesPlugin.PluginGuid));
-        }
-      }
-
-      if (Config.Instance.DungeonsPinType.Value is not Minimap.PinType.None && (Config.Instance.DungeonsPinTarget.Value & Config.PinTargets.MapTable) is not 0)
-      {
-        List<(ServersideQoLZDO, Vector3, string)>? updatedPos = null;
-        foreach (var (zdo, nullableValue) in playerState.Dungeons)
-        {
-          if (nullableValue is not { } value)
-          {
-            var hash = zdo.Vars.GetLocation();
-            if (hash is 0)
-              continue;
-
-            using var loc = ZoneSystem.instance.GetAndLoadLocationByHash(hash);
-            if (loc.Prefab is not { } prefab)
-              continue;
-
-            var found = false;
-            value = default;
-            foreach (var component in prefab.GetComponentsInChildren<Teleport>())
-            {
-              var pos = zdo.ZDO.GetPosition() + zdo.ZDO.GetRotation() * component.gameObject.transform.position;
-              if (Character.InInterior(pos))
-                continue;
-              found = true;
-              (updatedPos ??= []).Add((zdo, pos, component.m_enterText));
-              value = (pos, component.m_enterText);
-              break;
-            }
-
-            if (!found)
-              continue;
-          }
-
-          _pins.Add(new(playerState.PlayerID.AsModPlayerID(), Config.Instance.DungeonsLabel.Value is Config.DefaultOreDepositName ? value.Item2! : Config.Instance.DungeonsLabel.Value, zdo.ZDO.GetPosition(), Config.Instance.DungeonsPinType.Value, false, AutoMapTablesPlugin.PluginGuid));
-        }
-
-        if (updatedPos is not null)
-        {
-          foreach (var (zdo, pos, text) in updatedPos)
-            playerState.Dungeons[zdo] = (pos, text);
-        }
-      }
+      if (GetProcessorPrefabInfo(zdo) is { MineRockPinConfig: { } cfg, MineRock5: { } mineRock })
+        Add(zdo, cfg.Label.Value is Config.DefaultOreDepositName ? mineRock.m_name : cfg.Label.Value, cfg.PinType.Value);
     }
 
-    pkg.Clear();
-    pkg.Write((int)MapDataVersion);
-    pkg.Write(data ?? (_emptyExplored ??= new byte[Minimap.instance.m_textureSize * Minimap.instance.m_textureSize]));
-
-    pkg.Write(_pins.Count);
-    foreach (var pin in _pins)
+    List<(ServersideQoLZDO, Vector3, string)>? updatedPos = null;
+    foreach (var (zdo, nullableValue) in playerState.Dungeons)
     {
-      pkg.Write(pin.OwnerId.Value);
-      pkg.Write(pin.Tag);
-      pkg.Write(pin.Pos);
-      pkg.Write((int)pin.Type);
-      pkg.Write(pin.IsChecked);
-      pkg.Write(pin.Author);
+      if (nullableValue is not { } value)
+      {
+        var hash = zdo.Vars.GetLocation();
+        if (hash is 0)
+        {
+          complete = false;
+          continue;
+        }
+
+        using var loc = ZoneSystem.instance.GetAndLoadLocationByHash(hash);
+        if (loc.Prefab is not { } prefab)
+        {
+          complete = false;
+          continue;
+        }
+
+        var found = false;
+        value = default;
+        foreach (var component in prefab.GetComponentsInChildren<Teleport>())
+        {
+          var pos = zdo.ZDO.GetPosition() + zdo.ZDO.GetRotation() * component.gameObject.transform.position;
+          if (Character.InInterior(pos))
+            continue;
+          found = true;
+          (updatedPos ??= []).Add((zdo, pos, component.m_enterText));
+          value = (pos, component.m_enterText);
+          break;
+        }
+
+        if (!found)
+          continue;
+      }
+
+      Add(zdo, Config.Instance.DungeonsLabel.Value is Config.DefaultOreDepositName ? value.Item2! : Config.Instance.DungeonsLabel.Value, Config.Instance.DungeonsPinType.Value);
     }
 
-    state.ZDO.Vars.SetData(Utils.Compress(pkg.GetArray()));
-
-    ShowMessage(peers.Values.Select(static x => x.Item1), state.ZDO, Config.Instance.Localization.Value.Updated, Config.Instance.UpdatedMessageType.Value);
-
-    state.LastDataRevision = state.ZDO.ZDO.DataRevision;
-    _pins.Clear();
+    if (updatedPos is not null)
+    {
+      foreach (var (zdo, pos, text) in updatedPos)
+        playerState.Dungeons[zdo] = (pos, text);
+    }
+    return new(playerState.PlayerID.Value, pins.OrderBy(static pin => pin.Source, StringComparer.Ordinal).ToArray(),
+      complete, playerState.PlayerID.AsModPlayerID().Value);
   }
 
   void OnMapTableDestroyed(ServersideQoLZDO zdo)
@@ -509,6 +664,7 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
 
   void OnPortalDestroyed(ServersideQoLZDO zdo)
   {
+    RemoveGeneratedDiscovery(zdo);
     if (!_playerStates.TryGetValue(zdo.Vars.GetCreator(), out var state))
       return;
     if (state.Portals.Remove(zdo))
@@ -518,26 +674,16 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
   void OnShipDestroyed(ServersideQoLZDO zdo)
   {
     _shipPositions.Remove(zdo);
+    RemoveGeneratedDiscovery(zdo);
     if (!_playerStates.TryGetValue(zdo.Vars.GetCreator(), out var state))
       return;
     if (state.Ships.Remove(zdo))
       state.UpToDateMapTables.Clear();
   }
 
-  void OnWardDestroyed(ServersideQoLZDO zdo)
-  {
-    if (!_wards.Remove(zdo))
-      return;
-
-    foreach (var state in _mapTables.Values)
-    {
-      if (state.Wards?.Remove(zdo) is true)
-        UpdateMapTablePermittedPlayerIDs(state);
-    }
-  }
-
   void OnOreDepositDestroyed(ServersideQoLZDO zdo)
   {
+    RemoveGeneratedDiscovery(zdo);
     if (__playerIDsVar.Get(zdo) is not { } ids)
       return;
 
@@ -549,7 +695,32 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
         state.UpToDateMapTables.Clear();
     }
   }
-  readonly record struct Pin(PlayerID OwnerId, string Tag, Vector3 Pos, Minimap.PinType Type, bool IsChecked, string Author);
+
+  void OnDungeonDestroyed(ServersideQoLZDO zdo)
+  {
+    RemoveGeneratedDiscovery(zdo);
+    if (__playerIDsVar.Get(zdo) is not { } ids)
+      return;
+    foreach (var id in ids)
+    {
+      if (_playerStates.TryGetValue(id, out var state) && state.Dungeons.Remove(zdo))
+        state.UpToDateMapTables.Clear();
+    }
+  }
+
+  void RemoveGeneratedDiscovery(ServersideQoLZDO zdo)
+  {
+    if (_exploration?.RemoveGenerated(zdo.ZDO.m_uid.ToString()) is not true)
+      return;
+    try
+    {
+      _exploration.Flush(PersistExploration);
+    }
+    catch (Exception ex)
+    {
+      Logger.LogWarning($"Unable to persist removed discovery; dirty state retained for retry: {ex.Message}");
+    }
+  }
 
   sealed class PlayerState(PlayerID playerID)
   {
@@ -564,10 +735,7 @@ public sealed class AutoMapTablesProcessor : Processor<AutoMapTablesProcessor.Pr
   sealed class MapTableState(ServersideQoLZDO zdo)
   {
     public ServersideQoLZDO ZDO { get; } = zdo;
-    public uint LastDataRevision { get; set; }
-
-    /// <see cref="PrivateArea.CheckAccess"/>
-    public HashSet<ServersideQoLZDO>? Wards { get; set; }
-    public HashSet<PlayerID>? PermittedPlayerIDs { get; set; }
+    public SharedMapData.UpdateCursor Cursor { get; } = new();
+    public uint? FailedDataRevision { get; set; }
   }
 }

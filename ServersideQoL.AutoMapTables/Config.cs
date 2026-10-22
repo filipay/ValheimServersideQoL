@@ -10,11 +10,11 @@ public sealed class Config(ConfigFile cfg, Logger logger) : ConfigBase<Config>(c
   public override ConfigEntry<bool> Enabled { get; } = BindEx(cfg, true,
     "Enables/disables the entire mod");
   public ConfigEntry<float> MapTableRange { get; } = BindEx(cfg, ZoneSystem.c_ZoneSize,
-    "If a player enters this range around a map table, their discovered information (portal/ship/ore deposits/etc. position) is transfered to the map table.");
+    "An eligible character entering this range publishes their pending observed travel and discoveries with vanilla ward write access, and refreshes this table from world-shared data. Reading the table remains manual.");
   public ConfigEntry<Minimap.PinType> PortalsPinType { get; } = BindEx(cfg, Minimap.PinType.Icon4,
     "The pin type for portals on the map table", __acceptablePins);
   public ConfigEntry<Minimap.PinType> ShipsPinType { get; } = BindEx(cfg, Minimap.PinType.Player,
-    "The pin type for ships on the map table", new AcceptableEnum<Minimap.PinType>([..__acceptablePins.AcceptableValues, Minimap.PinType.Player]));
+    "The pin type for ships on the map table. Labels include the original builder's last-known name when available.", new AcceptableEnum<Minimap.PinType>([..__acceptablePins.AcceptableValues, Minimap.PinType.Player]));
   public ConfigEntry<Minimap.PinType> DungeonsPinType { get; } = BindEx(cfg, Minimap.PinType.Icon2,
     "The pin type for dungeons on the map table", __acceptablePins);    
   public ConfigEntry<string> DungeonsLabel { get; } = BindEx(cfg, DefaultOreDepositName,
@@ -41,7 +41,7 @@ public sealed class Config(ConfigFile cfg, Logger logger) : ConfigBase<Config>(c
   public ConfigEntry<MessageTypes> DiscoveredMessageType { get; } = BindEx(cfg, MessageTypes.TopLeftFar,
     "Type of message to show to a player when they discovered map information", new AcceptableEnum<MessageTypes>([MessageTypes.None, MessageTypes.TopLeftFar, MessageTypes.CenterFar, MessageTypes.InWorld]));
   public ConfigEntry<bool> DiscardPlayerPins { get; } = BindEx(cfg, false,
-    "True to discard custom player pins from map tables");
+    "Retained for config compatibility; has no discard effect. Custom player pins are preserved locally on each table even when true.");
   public YamlConfigEntry<LocalizationConfig> Localization { get; } = BindYaml<LocalizationConfig>(cfg);
   public YamlConfigEntry<AdvancedConfig> Advanced { get; } = BindYaml<AdvancedConfig>(cfg);
 

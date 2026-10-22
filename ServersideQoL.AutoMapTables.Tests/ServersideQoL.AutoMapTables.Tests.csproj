@@ -1,0 +1,21 @@
+<Project Sdk="MSTest.Sdk/4.3.2">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseVSTest>true</UseVSTest>
+    <CreatePackage>false</CreatePackage>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\ServersideQoL.AutoMapTables\WardAccess.cs" Link="WardAccess.cs" />
+    <Compile Include="..\ServersideQoL.AutoMapTables\WardIndex.cs" Link="WardIndex.cs" />
+    <Compile Include="..\ServersideQoL.AutoMapTables\ExplorationState.cs" Link="ExplorationState.cs" />
+    <Compile Include="..\ServersideQoL.AutoMapTables\SharedMapData.cs" Link="SharedMapData.cs" />
+    <Compile Include="..\ServersideQoL.AutoMapTables\ShipLabel.cs" Link="ShipLabel.cs" />
+    <None Include="..\ServersideQoL.AutoMapTables\AutoMapTablesProcessor.cs" Link="Production\AutoMapTablesProcessor.cs" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
